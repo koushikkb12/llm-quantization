@@ -106,7 +106,7 @@ llm-quantization-lab/
 
 ```bash
 git clone https://github.com/koushikkb12/llm-quantization.git
-cd llm-quantization-lab
+cd llm-quantization
 ```
 
 ### 2. Install dependencies
