@@ -105,7 +105,7 @@ llm-quantization-lab/
 ### 1. Clone the repo
 
 ```bash
-git clone git@github.com:YOUR_USERNAME/llm-quantization-lab.git
+git clone https://github.com/koushikkb12/llm-quantization.git
 cd llm-quantization-lab
 ```
 
