@@ -127,10 +127,14 @@ def main():
     print(f"📦 Creating repo {args.repo_id}...")
     api.create_repo(repo_id=args.repo_id, private=args.private, exist_ok=True)
     
-    # 3. Generate and save README.md
+    # 3. Generate and save README.md if it doesn't exist
     readme_path = models_dir / "README.md"
-    with open(readme_path, "w") as f:
-        f.write(generate_model_card(args, models_info))
+    if not readme_path.exists():
+        print("📝 Generating default README.md...")
+        with open(readme_path, "w") as f:
+            f.write(generate_model_card(args, models_info))
+    else:
+        print("📄 Using existing README.md...")
     
     # 4. Upload
     print(f"📤 Uploading files...")
