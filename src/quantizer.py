@@ -32,6 +32,7 @@ Dependencies:
 """
 
 import logging
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -40,6 +41,26 @@ from typing import List, Optional
 from .utils import QUANT_TYPES, get_project_root
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_run(cmd, *args, **kwargs):
+    """Run a subprocess through shell to reset FPU trapping state and prevent SIGFPE."""
+    import shlex
+    if isinstance(cmd, list):
+        cmd_str = shlex.join(cmd)
+    else:
+        cmd_str = cmd
+    
+    try:
+        import ctypes
+        libc = ctypes.CDLL(None)
+        if hasattr(libc, 'fedisableexcept'):
+            libc.fedisableexcept(0x3f)  # FE_ALL_EXCEPT is 0x3f on x86_64
+    except Exception as e:
+        logger.warning("⚠️ Could not disable FPU exceptions: %s", e)
+        
+    kwargs["shell"] = True
+    return subprocess.run(cmd_str, *args, **kwargs)
 
 
 class GGUFQuantizer:
@@ -96,6 +117,26 @@ class GGUFQuantizer:
 
         # After building with cmake, the quantize binary ends up here.
         self.quantize_binary: Path = self.llama_cpp_dir / "build" / "bin" / "llama-quantize"
+
+        # The imatrix binary generates importance matrices for calibrated quantization.
+        self.imatrix_binary: Path = self.llama_cpp_dir / "build" / "bin" / "llama-imatrix"
+
+        # The perplexity binary measures model quality.
+        self.perplexity_binary: Path = self.llama_cpp_dir / "build" / "bin" / "llama-perplexity"
+
+        # The gguf-split binary splits large GGUF files for HuggingFace upload.
+        self.gguf_split_binary: Path = self.llama_cpp_dir / "build" / "bin" / "llama-gguf-split"
+
+        # Disable floating-point exception trapping to prevent subprocess crashes (like SIGFPE).
+        # This is needed because some Python packages (like numpy/torch) enable exception trapping
+        # which subprocesses inherit, causing llama.cpp binaries to crash on division by zero / log(0).
+        try:
+            import ctypes
+            libc = ctypes.CDLL(None)
+            if hasattr(libc, 'fedisableexcept'):
+                libc.fedisableexcept(0x3f)  # FE_ALL_EXCEPT is 0x3f on x86_64
+        except Exception as e:
+            logger.warning("⚠️ Could not disable FPU exceptions: %s", e)
 
     # ──────────────────────────────────────────────────────────────────────
     # Setup helpers
@@ -213,6 +254,199 @@ class GGUFQuantizer:
         return True
 
     # ──────────────────────────────────────────────────────────────────────
+    # Calibration & iMatrix
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _get_default_calibration_data(self) -> Path:
+        """Download and prepare default calibration data for imatrix generation.
+        
+        Uses the WikiText-2 test split as calibration data. This is the standard
+        calibration dataset used by the quantization community because it contains
+        diverse, high-quality English text that exercises a wide range of the
+        model's capabilities.
+        
+        Returns:
+            Path: Path to the calibration text file.
+        """
+        calibration_dir = get_project_root() / "models" / "calibration"
+        calibration_file = calibration_dir / "calibration_data.txt"
+        
+        if calibration_file.exists():
+            logger.info("📄 Using existing calibration data: %s", calibration_file)
+            return calibration_file
+        
+        calibration_dir.mkdir(parents=True, exist_ok=True)
+        
+        logger.info("📥 Downloading WikiText-2 calibration data...")
+        loaded = False
+        
+        try:
+            from datasets import load_dataset
+            dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+            
+            with open(calibration_file, "w", encoding="utf-8") as f:
+                for i, item in enumerate(dataset):
+                    text = item["text"].strip()
+                    if text:  # Skip empty lines
+                        f.write(text + "\n")
+                    if i >= 500:  # Use first ~500 non-empty entries
+                        break
+            
+            logger.info("✅ Calibration data saved to %s", calibration_file)
+            loaded = True
+        except Exception as e:
+            logger.warning("⚠️  Could not load dataset via datasets library: %s. Trying manual download...", e)
+            
+        if not loaded:
+            try:
+                import urllib.request
+                import zipfile
+                import io
+                
+                zip_url = "https://huggingface.co/datasets/ggml-org/ci/resolve/main/wikitext-2-raw-v1.zip"
+                logger.info("📥 Downloading WikiText-2 zip from %s...", zip_url)
+                
+                req = urllib.request.Request(
+                    zip_url, 
+                    headers={'User-Agent': 'Mozilla/5.0'}
+                )
+                with urllib.request.urlopen(req) as response:
+                    zip_data = response.read()
+                
+                with zipfile.ZipFile(io.BytesIO(zip_data)) as z:
+                    test_file_name = [name for name in z.namelist() if "wiki.test.raw" in name][0]
+                    with z.open(test_file_name) as f_in:
+                        raw_text = f_in.read().decode('utf-8')
+                
+                lines = raw_text.splitlines()
+                count = 0
+                with open(calibration_file, "w", encoding="utf-8") as f_out:
+                    for line in lines:
+                        text = line.strip()
+                        if text:
+                            f_out.write(text + "\n")
+                            count += 1
+                            if count >= 500:
+                                break
+                logger.info("✅ Calibration data saved to %s (manually downloaded)", calibration_file)
+                loaded = True
+            except Exception as e_manual:
+                logger.error("❌ Manual calibration data download failed: %s", e_manual)
+        
+        if not loaded:
+            # Fallback: create a minimal but sufficiently long calibration file (>1024 tokens)
+            with open(calibration_file, "w", encoding="utf-8") as f:
+                fallback_sentences = [
+                    "The quick brown fox jumps over the lazy dog.",
+                    "Artificial intelligence is transforming the world of technology.",
+                    "Large language models can generate coherent text across many domains.",
+                    "Quantization reduces model size while preserving output quality.",
+                    "The transformer architecture revolutionized natural language processing."
+                ]
+                repeated_text = " ".join(fallback_sentences * 100) + "\n"
+                f.write(repeated_text)
+            logger.warning("⚠️  Using repeated fallback calibration data (length: %d chars)", len(repeated_text))
+        return calibration_file
+
+    def generate_imatrix(
+        self,
+        model_gguf: Path,
+        output_path: Path,
+        calibration_file: Optional[Path] = None,
+        n_ctx: int = 512,
+        n_batch: int = 512,
+        n_gpu_layers: int = -1,
+        fit: str = "on",
+        chunks: int = -1,
+    ) -> Path:
+        """Generate an importance matrix (imatrix) for calibrated quantization.
+        
+        An importance matrix measures how much each weight contributes to the
+        model's output quality. This information is then used during quantization
+        to allocate more bits to important weights and fewer bits to less
+        important ones.
+        
+        **Why imatrix matters for MoE models:**
+        
+        Standard k-quant heuristics assign precision based on layer *type*
+        (attention vs feed-forward). But in Mixture-of-Experts models, different
+        experts within the same layer can have wildly different importance.
+        An imatrix captures this per-weight importance, leading to dramatically
+        better quality for MoE quantization.
+        
+        **The process:**
+        1. Feed calibration text through the model
+        2. Track the magnitude of each weight's contribution
+        3. Save importance scores to a .dat file
+        4. Pass .dat to llama-quantize for importance-aware quantization
+        
+        Args:
+            model_gguf: Path to the GGUF model file (typically F16 baseline).
+            output_path: Where to save the importance matrix .dat file.
+            calibration_file: Path to calibration text file. If None, downloads
+                             WikiText-2 automatically.
+            n_ctx: Context window size for calibration (default: 512).
+            n_batch: Batch size for processing (default: 512).
+            n_gpu_layers: GPU layers to offload (-1 = all, 0 = CPU only).
+        
+        Returns:
+            Path: Path to the generated importance matrix file.
+        
+        Raises:
+            FileNotFoundError: If model or imatrix binary not found.
+            subprocess.CalledProcessError: If imatrix generation fails.
+        """
+        if not model_gguf.exists():
+            raise FileNotFoundError(f"Model GGUF not found: {model_gguf}")
+        
+        if not self.imatrix_binary.exists():
+            raise FileNotFoundError(
+                f"imatrix binary not found: {self.imatrix_binary}. "
+                f"Rebuild llama.cpp with clone_and_build()."
+            )
+        
+        if calibration_file is None:
+            calibration_file = self._get_default_calibration_data()
+        
+        if not calibration_file.exists():
+            raise FileNotFoundError(f"Calibration file not found: {calibration_file}")
+        
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        logger.info(
+            "🔬 Generating importance matrix...\n"
+            "   Model       : %s\n"
+            "   Calibration : %s\n"
+            "   Output      : %s\n"
+            "   Context     : %d tokens\n"
+            "   GPU layers  : %s\n"
+            "   Fit mode    : %s\n"
+            "   Chunks      : %s",
+            model_gguf.name, calibration_file.name, output_path,
+            n_ctx, "ALL" if n_gpu_layers == -1 else str(n_gpu_layers), fit,
+            "ALL" if chunks == -1 else str(chunks),
+        )
+        
+        cmd = [
+            str(self.imatrix_binary),
+            "-m", str(model_gguf),
+            "-f", str(calibration_file),
+            "-o", str(output_path),
+            "--ctx-size", str(n_ctx),
+            "-b", str(n_batch),
+            "-ngl", str(n_gpu_layers),
+            "--output-frequency", "10",  # Write every 10 iterations to avoid division-by-zero crash in llama.cpp
+            "--fit", fit,
+        ]
+        if chunks > 0:
+            cmd.extend(["--chunks", str(chunks)])
+        
+        _safe_run(cmd, check=True)
+        
+        logger.info("✅ Importance matrix generated → %s", output_path)
+        return output_path
+
+    # ──────────────────────────────────────────────────────────────────────
     # Conversion
     # ──────────────────────────────────────────────────────────────────────
 
@@ -262,7 +496,7 @@ class GGUFQuantizer:
 
         # The convert script is a Python script that uses the current Python
         # interpreter.  We pass --outtype f16 to get a half-precision baseline.
-        subprocess.run(
+        _safe_run(
             [
                 sys.executable,               # Use the same Python that's running us
                 str(self.convert_script),
@@ -280,7 +514,7 @@ class GGUFQuantizer:
     # Quantization
     # ──────────────────────────────────────────────────────────────────────
 
-    def quantize(self, input_gguf: Path, output_gguf: Path, quant_type: str) -> Path:
+    def quantize(self, input_gguf: Path, output_gguf: Path, quant_type: str, imatrix_path: Optional[Path] = None) -> Path:
         """Quantize a GGUF model to a specific lower-bit representation.
 
         **What happens under the hood:**
@@ -340,16 +574,20 @@ class GGUFQuantizer:
         )
 
         # ── Run llama-quantize ───────────────────────────────────────────
-        # Usage: llama-quantize <input.gguf> <output.gguf> <type>
-        subprocess.run(
-            [
-                str(self.quantize_binary),
-                str(input_gguf),
-                str(output_gguf),
-                quant_type,
-            ],
-            check=True,
-        )
+        # Usage: llama-quantize [--imatrix <imatrix.dat>] <input.gguf> <output.gguf> <type>
+        cmd = [str(self.quantize_binary)]
+        if imatrix_path is not None:
+            if not imatrix_path.exists():
+                raise FileNotFoundError(f"Importance matrix not found: {imatrix_path}")
+            cmd.extend(["--imatrix", str(imatrix_path)])
+        
+        cmd.extend([
+            str(input_gguf),
+            str(output_gguf),
+            quant_type,
+        ])
+        
+        _safe_run(cmd, check=True)
 
         logger.info("✅ Quantization complete → %s", output_gguf)
         return output_gguf
@@ -359,6 +597,7 @@ class GGUFQuantizer:
         input_gguf: Path,
         output_dir: Path,
         quant_types: Optional[List[str]] = None,
+        imatrix_path: Optional[Path] = None,
     ) -> List[Path]:
         """Quantize a GGUF model to multiple quantization levels.
 
@@ -415,7 +654,7 @@ class GGUFQuantizer:
             )
 
             try:
-                self.quantize(input_gguf, output_path, qtype)
+                self.quantize(input_gguf, output_path, qtype, imatrix_path=imatrix_path)
                 created[qtype] = output_path
             except (subprocess.CalledProcessError, FileNotFoundError) as exc:
                 logger.error("❌ Failed to quantize to %s: %s", qtype, exc)
@@ -427,3 +666,179 @@ class GGUFQuantizer:
         )
 
         return created
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Evaluation & Utilities
+    # ──────────────────────────────────────────────────────────────────────
+
+    def evaluate_perplexity(
+        self,
+        model_gguf: Path,
+        n_ctx: int = 512,
+        n_batch: int = 512,
+        n_gpu_layers: int = -1,
+    ) -> dict:
+        """Evaluate model perplexity using llama-perplexity.
+        
+        Perplexity is the standard metric for measuring language model quality.
+        Lower values indicate better quality. A perplexity of N means the model
+        is, on average, as uncertain as choosing uniformly among N options.
+        
+        Typical perplexity ranges for quantized models:
+            - F16 baseline: ~5-8 (depending on model)
+            - Q8_0: +0.01-0.05 above baseline
+            - Q4_K_M: +0.05-0.2 above baseline
+            - Q2_K: +0.5-5.0 above baseline (significant degradation)
+        
+        Args:
+            model_gguf: Path to the GGUF model file to evaluate.
+            n_ctx: Context window size for evaluation.
+            n_batch: Batch size for processing.
+            n_gpu_layers: GPU layers to offload (-1 = all).
+        
+        Returns:
+            dict: Results containing 'model_name', 'perplexity', 'n_ctx'.
+        
+        Raises:
+            FileNotFoundError: If model or perplexity binary not found.
+            RuntimeError: If perplexity cannot be parsed from output.
+        """
+        if not model_gguf.exists():
+            raise FileNotFoundError(f"Model GGUF not found: {model_gguf}")
+        
+        if not self.perplexity_binary.exists():
+            raise FileNotFoundError(
+                f"Perplexity binary not found: {self.perplexity_binary}. "
+                f"Rebuild llama.cpp with clone_and_build()."
+            )
+        
+        calibration_file = self._get_default_calibration_data()
+        
+        logger.info(
+            "📏 Evaluating perplexity...\n"
+            "   Model   : %s\n"
+            "   Context : %d tokens",
+            model_gguf.name, n_ctx,
+        )
+        
+        cmd = [
+            str(self.perplexity_binary),
+            "-m", str(model_gguf),
+            "-f", str(calibration_file),
+            "--ctx-size", str(n_ctx),
+            "-b", str(n_batch),
+            "-ngl", str(n_gpu_layers),
+        ]
+        
+        result = _safe_run(cmd, capture_output=True, text=True, check=True)
+        output = result.stdout + result.stderr
+        
+        # Parse perplexity from output.
+        # llama-perplexity outputs lines like:
+        # "Final estimate: PPL = 5.1234 +/- 0.0567"
+        ppl_value = None
+        for line in output.split("\n"):
+            # Try multiple patterns that llama-perplexity might output
+            match = re.search(r'(?:Final estimate:|perplexity).*?=\s*([\d.]+)', line, re.IGNORECASE)
+            if match:
+                ppl_value = float(match.group(1))
+        
+        if ppl_value is None:
+            # Fallback: look for any line with "PPL" and a number
+            for line in output.split("\n"):
+                match = re.search(r'PPL\s*=?\s*([\d.]+)', line)
+                if match:
+                    ppl_value = float(match.group(1))
+        
+        if ppl_value is None:
+            logger.error("Could not parse perplexity from output:\n%s", output[-2000:])
+            raise RuntimeError(
+                "Failed to parse perplexity value from llama-perplexity output. "
+                "Check the model file and calibration data."
+            )
+        
+        result_dict = {
+            "model_name": model_gguf.name,
+            "perplexity": round(ppl_value, 4),
+            "n_ctx": n_ctx,
+        }
+        
+        logger.info(
+            "✅ Perplexity: %.4f (model: %s)",
+            ppl_value, model_gguf.name,
+        )
+        
+        return result_dict
+
+    def split_gguf(
+        self,
+        input_gguf: Path,
+        output_dir: Path,
+        max_size_gb: float = 49.0,
+    ) -> List[Path]:
+        """Split a large GGUF file into smaller parts for upload.
+        
+        HuggingFace Hub has a 50 GB file size limit. Models larger than this
+        need to be split into multiple parts. The llama-gguf-split tool handles
+        this while preserving the GGUF format's integrity.
+        
+        Users can load split models by pointing their GGUF loader at the first
+        part file — the loader will automatically find and load subsequent parts.
+        
+        Args:
+            input_gguf: Path to the GGUF file to split.
+            output_dir: Directory to write split files into.
+            max_size_gb: Maximum size per split file in GB (default: 49.0,
+                         just under HuggingFace's 50 GB limit).
+        
+        Returns:
+            List[Path]: Paths to all created split files.
+        
+        Raises:
+            FileNotFoundError: If input file or split binary not found.
+            subprocess.CalledProcessError: If splitting fails.
+        """
+        if not input_gguf.exists():
+            raise FileNotFoundError(f"Input GGUF not found: {input_gguf}")
+        
+        if not self.gguf_split_binary.exists():
+            raise FileNotFoundError(
+                f"gguf-split binary not found: {self.gguf_split_binary}. "
+                f"Rebuild llama.cpp with clone_and_build()."
+            )
+        
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Output basename for split files
+        output_base = output_dir / input_gguf.stem
+        
+        logger.info(
+            "✂️  Splitting GGUF file...\n"
+            "   Input    : %s\n"
+            "   Max size : %.1f GB\n"
+            "   Output   : %s",
+            input_gguf.name, max_size_gb, output_dir,
+        )
+        
+        max_size_bytes = int(max_size_gb * 1024 * 1024 * 1024)
+        
+        _safe_run(
+            [
+                str(self.gguf_split_binary),
+                "--split",
+                "--split-max-size", str(max_size_bytes),
+                str(input_gguf),
+                str(output_base),
+            ],
+            check=True,
+        )
+        
+        # Find all created split files
+        split_files = sorted(output_dir.glob(f"{input_gguf.stem}-*"))
+        
+        logger.info(
+            "✅ Split into %d files in %s",
+            len(split_files), output_dir,
+        )
+        
+        return split_files

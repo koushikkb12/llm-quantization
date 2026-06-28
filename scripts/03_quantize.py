@@ -28,6 +28,13 @@ For K-quant types (Q4_K_M, Q5_K_M, Q2_K):
   Q4_K_M: ~4x compression
   Q4_0:   ~4x compression
   Q2_K:   ~6-8x compression
+
+=== Importance Matrix (imatrix) Calibration ===
+For MoE and large models, pass --imatrix to use a pre-computed importance
+matrix. This tells the quantizer which weights matter most, resulting in
+significantly better quality — especially at lower bit-widths (Q2, Q3, IQ).
+
+Generate an imatrix with: python scripts/06_generate_imatrix.py
 """
 
 import sys
@@ -37,11 +44,11 @@ from pathlib import Path
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.utils import get_models_dir, get_model_size, format_size, QUANT_TYPES, QUANT_TYPES_TO_RUN
+from src.utils import get_models_dir, get_model_size, format_size, QUANT_TYPES, QUANT_TYPES_TO_RUN, PRODUCTION_QUANT_LADDER
 from src.quantizer import GGUFQuantizer
 
 
-def quantize_all(input_gguf: Path, output_dir: Path, quant_types: list) -> dict:
+def quantize_all(input_gguf: Path, output_dir: Path, quant_types: list, imatrix_path=None) -> dict:
     """
     Quantize a GGUF model to multiple bit-widths.
     
@@ -65,10 +72,15 @@ def quantize_all(input_gguf: Path, output_dir: Path, quant_types: list) -> dict:
     for qt in quant_types:
         desc = QUANT_TYPES.get(qt, "Unknown")
         print(f"   {qt:>8s}: {desc}")
+        
+    if imatrix_path:
+        print(f"\n   🔬 Using importance matrix: {imatrix_path}")
+        print(f"   This will produce higher-quality quantizations,")
+        print(f"   especially for MoE models and low-bit (Q2/Q3/IQ) types.")
     print()
     
     # Run quantization for each type
-    results = quantizer.quantize_all(input_gguf, output_dir, quant_types)
+    results = quantizer.quantize_all(input_gguf, output_dir, quant_types, imatrix_path=imatrix_path)
     
     # Print final comparison table
     if results:
@@ -123,9 +135,11 @@ Available quantization types:
   Q2_K   — 2-bit, extreme compression
 
 Examples:
-  python 03_quantize.py                          # Quantize to all types
-  python 03_quantize.py --types Q4_K_M Q8_0      # Only specific types
-  python 03_quantize.py --input path/to/model.gguf
+  python 03_quantize.py                                    # Quantize to default types
+  python 03_quantize.py --types Q4_K_M Q8_0                # Only specific types
+  python 03_quantize.py --production                        # Full production ladder (12 types)
+  python 03_quantize.py --imatrix path/to/imatrix.dat       # Use importance matrix
+  python 03_quantize.py --production --imatrix imatrix.dat  # Production + imatrix (best quality)
         """
     )
     
@@ -147,17 +161,38 @@ Examples:
     parser.add_argument(
         "--types",
         nargs="+",
-        choices=QUANT_TYPES_TO_RUN,
+        choices=list(QUANT_TYPES.keys()),
         default=QUANT_TYPES_TO_RUN,
         help="Quantization types to create (default: all)"
+    )
+    parser.add_argument(
+        '--imatrix',
+        type=str,
+        default=None,
+        help='Path to importance matrix file (.dat) for calibrated quantization. '
+             'Strongly recommended for MoE models. Generate with 06_generate_imatrix.py'
+    )
+    parser.add_argument(
+        '--production',
+        action='store_true',
+        help='Use the full production quantization ladder (12 types) for HuggingFace publishing'
     )
     
     args = parser.parse_args()
     
+    # Determine which quant types to use
+    if args.production:
+        selected_types = PRODUCTION_QUANT_LADDER
+    else:
+        selected_types = args.types
+
+    imatrix_path = Path(args.imatrix) if args.imatrix else None
+
     results = quantize_all(
         Path(args.input),
         Path(args.output_dir),
-        args.types
+        selected_types,
+        imatrix_path=imatrix_path,
     )
     
     sys.exit(0 if results else 1)

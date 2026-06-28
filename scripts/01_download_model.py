@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.utils import DEFAULT_MODEL_ID, get_models_dir, format_size, estimate_model_sizes
 
 
-def download_model(model_id: str, output_dir: Path) -> Path:
+def download_model(model_id: str, output_dir: Path, token: str = None) -> Path:
     """
     Download a model from HuggingFace Hub.
     
@@ -57,31 +57,53 @@ def download_model(model_id: str, output_dir: Path) -> Path:
     print(f"  📂 Destination: {local_dir}")
     print(f"{'='*60}\n")
     
-    # Educational info about model sizes
-    print("💡 Understanding model sizes:")
-    print("   Each parameter is stored as a number.")
-    print("   The 'precision' determines how many bytes each number uses:\n")
-    
-    # Estimate sizes for this model (135M params)
-    num_params = 135_000_000  # SmolLM2-135M
-    sizes = estimate_model_sizes(num_params)
-    for precision, size_mb in sizes.items():
-        print(f"   {precision:>20s}: {size_mb:>8.1f} MB")
-    
-    print(f"\n   Our goal: go from FP16 ({sizes['FP16 (16-bit)']:.0f} MB) to ")
-    print(f"   INT4 ({sizes['INT4 (4-bit)']:.0f} MB) — a {sizes['FP16 (16-bit)']/sizes['INT4 (4-bit)']:.0f}x reduction!\n")
-    
     # Download the model
     print("⏳ Downloading model files...\n")
     downloaded_path = snapshot_download(
         repo_id=model_id,
         local_dir=str(local_dir),
         local_dir_use_symlinks=False,
+        token=token,
     )
     
     # Show what was downloaded
     print(f"\n✅ Download complete!")
     print(f"   Location: {downloaded_path}\n")
+    
+    # Educational info about model sizes
+    print("💡 Understanding model sizes:")
+    print("   Each parameter is stored as a number.")
+    print("   The 'precision' determines how many bytes each number uses:\n")
+    
+    # Try to detect model size from config
+    try:
+        import json as _json
+        config_path = local_dir / "config.json"
+        if config_path.exists():
+            with open(config_path) as f:
+                config = _json.load(f)
+            # Try common fields for parameter count
+            num_params = config.get("num_parameters", None)
+            if num_params is None:
+                # Estimate from architecture dimensions
+                hidden = config.get("hidden_size", config.get("d_model", 0))
+                layers = config.get("num_hidden_layers", config.get("n_layer", 0))
+                vocab = config.get("vocab_size", 0)
+                intermediate = config.get("intermediate_size", hidden * 4)
+                if hidden and layers and vocab:
+                    # Rough estimate: embeddings + transformer layers
+                    num_params = vocab * hidden + layers * (4 * hidden * hidden + 2 * hidden * intermediate)
+        if num_params:
+            print(f"\n💡 Estimated model parameters: {num_params/1e9:.1f}B ({num_params:,})")
+            sizes = estimate_model_sizes(num_params)
+            for precision, size_mb in sizes.items():
+                print(f"   {precision:>20s}: {size_mb:>8.1f} MB")
+            
+            if 'FP16 (16-bit)' in sizes and 'INT4 (4-bit)' in sizes:
+                print(f"\n   Our goal: go from FP16 ({sizes['FP16 (16-bit)']:.0f} MB) to ")
+                print(f"   INT4 ({sizes['INT4 (4-bit)']:.0f} MB) — a {sizes['FP16 (16-bit)']/sizes['INT4 (4-bit)']:.0f}x reduction!\n")
+    except Exception:
+        pass  # Non-critical — skip if detection fails
     
     total_size = 0
     print("   Files downloaded:")
@@ -119,13 +141,20 @@ Examples:
         default=None,
         help="Directory to save the model (default: models/original/)"
     )
+    parser.add_argument(
+        '--token',
+        type=str,
+        default=None,
+        help='HuggingFace access token for gated models (e.g., Llama, Gemma). '
+             'Get yours at https://huggingface.co/settings/tokens'
+    )
     
     args = parser.parse_args()
     
     # Use default models directory if not specified
     output_dir = Path(args.output_dir) if args.output_dir else get_models_dir()["original"]
     
-    model_path = download_model(args.model_id, output_dir)
+    model_path = download_model(args.model_id, output_dir, token=args.token)
     
     print(f"\n🎯 Next step: Convert to GGUF format")
     print(f"   python scripts/02_convert_to_gguf.py --model-dir {model_path}")

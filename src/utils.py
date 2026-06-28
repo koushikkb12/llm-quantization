@@ -33,14 +33,33 @@ DEFAULT_MODEL_ID = "HuggingFaceTB/SmolLM2-135M"
 QUANT_TYPES = OrderedDict([
     ("F16", "Half precision (16-bit float) — baseline, no quantization"),
     ("Q8_0", "8-bit quantization — minimal quality loss, ~2x compression"),
+    ("Q6_K", "6-bit k-quant — near-lossless quality, ~2.5x compression"),
     ("Q5_K_M", "5-bit k-quant (medium) — good balance of size and quality"),
+    ("Q5_K_S", "5-bit k-quant (small) — slightly more aggressive than Q5_K_M"),
     ("Q4_K_M", "4-bit k-quant (medium) — most popular for deployment, ~4x compression"),
+    ("Q4_K_S", "4-bit k-quant (small) — slightly smaller than Q4_K_M"),
     ("Q4_0", "4-bit basic — faster quantization, slightly lower quality than Q4_K_M"),
+    ("IQ4_NL", "4-bit non-linear — experimental imatrix quant, good quality"),
+    ("IQ4_XS", "4-bit extra-small — experimental, better compression than IQ4_NL"),
+    ("Q3_K_L", "3-bit k-quant (large) — best quality among 3-bit variants"),
+    ("Q3_K_M", "3-bit k-quant (medium) — good balance at 3-bit level"),
+    ("Q3_K_S", "3-bit k-quant (small) — smallest 3-bit variant"),
+    ("IQ3_XXS", "3-bit ultra extra-small — experimental, extreme compression"),
     ("Q2_K", "2-bit k-quant — extreme compression (~8x), noticeable quality loss"),
+    ("IQ2_XXS", "2-bit ultra extra-small — experimental, most extreme compression"),
 ])
 
 # Quantization types to actually quantize (everything except F16, which is the baseline)
 QUANT_TYPES_TO_RUN = [k for k in QUANT_TYPES if k != "F16"]
+
+# Production quant ladder — the standard set for publishing to HuggingFace.
+# Covers the full spectrum from near-lossless (Q8_0) to extreme compression (Q2_K).
+# This is what popular quantizers like bartowski and Unsloth typically produce.
+PRODUCTION_QUANT_LADDER = [
+    'Q8_0', 'Q6_K', 'Q5_K_M', 'Q5_K_S', 'Q4_K_M', 'Q4_K_S',
+    'Q4_0', 'Q3_K_L', 'Q3_K_M', 'Q3_K_S', 'IQ4_NL', 'Q2_K',
+]
+
 
 
 # ============================================================================
