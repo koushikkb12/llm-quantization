@@ -100,6 +100,72 @@ llm-quantization-lab/
 
 ---
 
+## Building llama.cpp (CPU vs GPU)
+
+Our pipeline automatically clones and builds `llama.cpp` for you the first time you run it. It will try to detect an NVIDIA GPU and build with CUDA support if possible. 
+
+However, if you want to build it manually or understand how it works under the hood, here are the detailed instructions:
+
+### 1. CPU-Only Build (Default)
+If you don't have a GPU or just want to run everything on your CPU, use the default build:
+
+```bash
+# Clone the repository
+git clone https://github.com/ggerganov/llama.cpp
+cd llama.cpp
+
+# Create a build directory
+mkdir build && cd build
+
+# Configure for CPU (default)
+cmake ..
+
+# Compile the tools (this builds llama-quantize, llama-cli, etc.)
+cmake --build . --config Release -j $(nproc)
+```
+
+### 2. GPU Build (NVIDIA / CUDA)
+If you have an NVIDIA GPU, building with CUDA support will drastically speed up inference and processing.
+
+**Prerequisites:** You must have the CUDA Toolkit installed (`nvcc --version` should work).
+
+```bash
+# Clone the repository
+git clone https://github.com/ggerganov/llama.cpp
+cd llama.cpp
+
+# Create a build directory
+mkdir build && cd build
+
+# Configure for CUDA GPU acceleration
+cmake .. -DGGML_CUDA=ON
+
+# Compile the tools
+cmake --build . --config Release -j $(nproc)
+```
+
+> **Note on Architecture:** CMake will try to auto-detect your GPU architecture (e.g., Ada, Blackwell, Ampere). If it fails or you move the binary to another machine, you can force it by setting the architecture manually during configuration, e.g., `-DCMAKE_CUDA_ARCHITECTURES=89`.
+
+### 3. Apple Silicon (Mac M1/M2/M3)
+If you are on a Mac with Apple Silicon, `llama.cpp` uses the Metal framework for GPU acceleration by default.
+
+```bash
+# Clone the repository
+git clone https://github.com/ggerganov/llama.cpp
+cd llama.cpp
+
+# Create a build directory
+mkdir build && cd build
+
+# Configure (Metal is enabled by default on macOS)
+cmake ..
+
+# Compile
+cmake --build . --config Release -j $(sysctl -n hw.logicalcpu)
+```
+
+---
+
 ## Quick Start
 
 ### 1. Clone the repo
