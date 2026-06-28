@@ -142,7 +142,8 @@ def main():
     api.upload_folder(
         folder_path=str(models_dir),
         repo_id=args.repo_id,
-        repo_type="model"
+        repo_type="model",
+        ignore_patterns=["*/**"]
     )
     
     print(f"\n✅ Upload complete! View your model at:")
